@@ -3626,32 +3626,14 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             }
         }
         let holder_credit = |peer: &PeerId, key: &XorName| -> bool {
-            if !locally_held.contains(key) {
-                // Replica-fetch path: we don't hold this key, so we
-                // cannot have collected audit credit for it. Trust
-                // Present claims to drive fetch-source promotion;
-                // chunk-PUT payment_verifier is the security backstop
-                // when the bytes actually arrive.
-                return true;
-            }
-            if !capable_peer_snapshot.contains(peer) {
-                // Pre-v12 / legacy peer that has never gossiped a
-                // commitment. The v12 §6 holder-eligibility check
-                // doesn't apply: their Present evidence comes through
-                // the legacy path and we credit it unconditionally
-                // so a mixed-version network stays live during
-                // transition.
-                return true;
-            }
-            let Some(hash) = commitment_by_peer_snapshot.get(peer) else {
-                // Peer is commitment_capable (sticky) but currently
-                // has no live commitment record on file (e.g. their
-                // last gossip was evicted from the LRU cache, or it
-                // failed verification). Withhold credit until they
-                // re-prove storage under a fresh commitment.
-                return false;
-            };
-            provers_snapshot.is_credited_holder(key, peer, hash)
+            holder_credit_decision(
+                locally_held.contains(key),
+                commitment_by_peer_snapshot.get(peer).copied(),
+                capable_peer_snapshot.contains(peer),
+                &provers_snapshot,
+                key,
+                peer,
+            )
         };
 
         let mut evaluated: Vec<(XorName, KeyVerificationOutcome, HintPipeline)> = Vec::new();
@@ -4333,6 +4315,60 @@ async fn handle_audit_result(
         }
         AuditTickResult::Idle | AuditTickResult::InsufficientKeys => {}
     }
+}
+
+/// v12 §6 holder-eligibility credit decision (extracted from the inline
+/// closure in the verification cycle so it is unit-testable).
+///
+/// Decides whether `peer`'s `Present` claim for `key` should count toward
+/// storage / paid-list quorum. A **live commitment record is authoritative**:
+/// if we currently hold one for `peer`, the decision gates on real audit credit
+/// (`RecentProvers::is_credited_holder`) regardless of whether `peer` is in the
+/// sticky `ever_capable` set.
+///
+/// This ordering closes a fail-open: previously the sticky-set check ran first,
+/// so a peer we hold a commitment for — but who is absent from `ever_capable`
+/// (because it saturated at `MAX_EVER_CAPABLE_PEERS`, or the two maps drifted) —
+/// took the "legacy" branch and was credited *unconditionally*, silently
+/// disabling the §6 possession gate on the only gate protecting the
+/// payment-free replication-fetch/keep path. Behavior is identical in every
+/// other case (fetch path, genuine legacy, sticky-but-evicted).
+///
+/// Arguments:
+/// - `locally_held`: whether THIS node holds `key` (only then is local audit
+///   credit possible; the replica-fetch path cannot have collected credit).
+/// - `live_commitment`: `peer`'s current commitment hash if we hold a verified
+///   record for it.
+/// - `sticky_capable`: whether `peer` is in the sticky `ever_capable` set.
+/// - `provers`: the recent-provers audit-credit cache.
+fn holder_credit_decision(
+    locally_held: bool,
+    live_commitment: Option<[u8; 32]>,
+    sticky_capable: bool,
+    provers: &RecentProvers,
+    key: &XorName,
+    peer: &PeerId,
+) -> bool {
+    // Fetch path: no local audit credit is possible; a Present claim only
+    // drives fetch-source promotion (chunk-PUT verification is the backstop when
+    // bytes actually arrive). Unchanged.
+    if !locally_held {
+        return true;
+    }
+    // AUTHORITATIVE: a live, verified commitment means §6 applies regardless of
+    // whether the sticky set had room to record this peer. Closes the
+    // cap-saturation / drift fail-open.
+    if let Some(hash) = live_commitment {
+        return provers.is_credited_holder(key, peer, &hash);
+    }
+    // Sticky-capable but no live commitment on file (evicted / failed verify):
+    // withhold credit until re-proof. Unchanged.
+    if sticky_capable {
+        return false;
+    }
+    // Genuine pre-v12 legacy peer (never sent a commitment): credit
+    // unconditionally so mixed-version networks stay live. Unchanged.
+    true
 }
 
 /// Whether a confirmed audit failure with this reason should revoke the
@@ -5079,6 +5115,54 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = b;
         k
+    }
+
+    /// PR: holder-credit gate. A live commitment record must be authoritative
+    /// over the sticky `ever_capable` cap: a peer we hold a commitment for is
+    /// gated on real audit credit even when it is absent from the sticky set
+    /// (the cap-saturation / drift fail-open). Every other branch is unchanged.
+    #[test]
+    fn commitment_on_file_gates_even_when_not_in_sticky_set() {
+        use super::holder_credit_decision;
+        let key = test_key(1);
+        let peer = test_peer(0xAB);
+        let hash = [0xCD; 32];
+        let mut provers = RecentProvers::new();
+
+        // Drift/saturation case: we hold a live commitment but sticky = false,
+        // and the peer has NOT passed an audit for this key under `hash`.
+        // Pre-fix this returned `true` (legacy credit); it must withhold.
+        assert!(
+            !holder_credit_decision(true, Some(hash), false, &provers, &key, &peer),
+            "a peer we hold a commitment for must be gated on audit credit, not \
+             credited as legacy just because the sticky set overflowed"
+        );
+
+        // After a real audit records proof under `hash`, credit is granted.
+        provers.record_proof(key, peer, hash, std::time::Instant::now());
+        assert!(holder_credit_decision(
+            true,
+            Some(hash),
+            false,
+            &provers,
+            &key,
+            &peer
+        ));
+
+        // Genuine legacy (no commitment on file) still gets liveness credit.
+        assert!(holder_credit_decision(
+            true, None, false, &provers, &key, &peer
+        ));
+
+        // Sticky-capable but commitment evicted -> still withheld (unchanged).
+        assert!(!holder_credit_decision(
+            true, None, true, &provers, &key, &peer
+        ));
+
+        // Fetch path (key not locally held) -> always credited (unchanged).
+        assert!(holder_credit_decision(
+            false, None, true, &provers, &key, &peer
+        ));
     }
 
     #[test]
