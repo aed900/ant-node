@@ -43,12 +43,16 @@
 //! `bootstrap::note_capacity_rejected` /
 //! `bootstrap::check_bootstrap_drained`) end-to-end through the same
 //! call sequence that the live replication loop runs when handling an
-//! over-cap `NeighborSyncRequest`. With no fix this test passes — i.e.
-//! it documents the buggy behaviour by asserting the victim never
-//! drains. The fix (whatever shape it takes — per-source rate limits,
-//! capacity-reject decay, trust-event escalation, ...) will need a
-//! follow-up test asserting drain happens within a bounded number of
-//! over-cap cycles.
+//! over-cap `NeighborSyncRequest`. This test documents the buggy shape by
+//! asserting the victim does not drain *within the test's sub-second window*.
+//!
+//! Update: the stall is now BOUNDED (not permanent) by the per-source
+//! re-deliver TTL + absolute deadline in `replication::bootstrap`
+//! (`CAPACITY_REJECT_REDELIVER_TTL` / `BOOTSTRAP_MAX_DURATION`). The
+//! bounded-completion guarantee the fix requires is asserted by the
+//! `stalled_capacity_rejected_source_cannot_block_drain_forever` and
+//! `bootstrap_force_completes_at_absolute_deadline` unit tests in
+//! `bootstrap.rs`. This test is retained as the attack-shape marker.
 
 #![allow(
     clippy::unwrap_used,
@@ -212,12 +216,21 @@ async fn poc_bootstrap_stall_via_persistent_per_peer_overflow() {
     // `capacity_rejected_sources`. The victim is permanently in
     // bootstrap mode. This is the bug.
     let state = bootstrap_state.read().await;
+    // With the per-source-TTL + absolute-deadline backstop
+    // (replication::bootstrap::{CAPACITY_REJECT_REDELIVER_TTL,
+    // BOOTSTRAP_MAX_DURATION}) the stall is now BOUNDED rather than permanent.
+    // This test still observes the attacker outstanding because it runs in
+    // milliseconds — far below the 30-minute re-deliver TTL — so within its
+    // window the block is unchanged. The bounded-completion guarantee is
+    // covered by the `stalled_capacity_rejected_source_cannot_block_drain_forever`
+    // and `bootstrap_force_completes_at_absolute_deadline` unit tests in
+    // `bootstrap.rs`.
     assert!(
-        state.capacity_rejected_sources.contains(&attacker),
-        "attacker peer is still in capacity_rejected_sources after the flood — \
-         this is the documented stall: the victim has no mechanism to retire \
-         the attacker without the attacker's cooperation (a 'clean' admission \
-         cycle), so a hostile peer can stall bootstrap indefinitely"
+        state.capacity_rejected_sources.contains_key(&attacker),
+        "attacker peer is still in capacity_rejected_sources within the TTL \
+         window after the flood — the stall is real but now bounded by \
+         CAPACITY_REJECT_REDELIVER_TTL / BOOTSTRAP_MAX_DURATION rather than \
+         permanent"
     );
     assert_eq!(
         state.capacity_rejected_sources.len(),
@@ -256,11 +269,11 @@ async fn honest_peer_drains_normally_alongside_attacker() {
 
     let state = bootstrap_state.read().await;
     assert!(
-        state.capacity_rejected_sources.contains(&attacker),
+        state.capacity_rejected_sources.contains_key(&attacker),
         "attacker is outstanding"
     );
     assert!(
-        !state.capacity_rejected_sources.contains(&honest),
+        !state.capacity_rejected_sources.contains_key(&honest),
         "honest peer is NOT outstanding; its clean cycle cleared (or never created) its entry"
     );
 }

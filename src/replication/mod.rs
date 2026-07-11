@@ -1242,6 +1242,13 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let sync_state = Arc::clone(&self.sync_state);
+        // For the bootstrap-drain poll below: this audit-loop timer is the only
+        // thing that re-evaluates drain under a hit-and-run capacity-reject
+        // stall (no verification cycle runs to call check_bootstrap_drained
+        // from its own sites), so it needs the queues and the completion
+        // notifier to apply the per-source-TTL / absolute-deadline backstops.
+        let queues = Arc::clone(&self.queues);
+        let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
 
         let handle = tokio::spawn(async move {
             // Invariant 19: wait for bootstrap to drain before starting audits.
@@ -1251,7 +1258,31 @@ impl ReplicationEngine {
                     () = tokio::time::sleep(
                         std::time::Duration::from_secs(BOOTSTRAP_DRAIN_CHECK_SECS)
                     ) => {
+                        // Fast path: bootstrap was already completed elsewhere
+                        // (the verify worker or the bootstrap-sync task).
                         if bootstrap_state.read().await.is_drained() {
+                            break;
+                        }
+                        // Otherwise actively evaluate the drain condition here.
+                        // This poll is the ONLY drain re-evaluation under a
+                        // hit-and-run capacity-reject stall: the attacker sends
+                        // one over-cap NeighborSyncRequest then goes silent, so
+                        // no verification cycle runs to call
+                        // check_bootstrap_drained from its own sites. Without
+                        // this, the per-source TTL / absolute-deadline
+                        // backstops added in bootstrap.rs would never be
+                        // applied and `is_bootstrapping` would stay true
+                        // forever, permanently pausing this node's audits.
+                        let newly_drained = {
+                            let q = queues.read().await;
+                            bootstrap::check_bootstrap_drained(&bootstrap_state, &q).await
+                        };
+                        if newly_drained {
+                            complete_bootstrap(
+                                &is_bootstrapping,
+                                &bootstrap_complete_notify,
+                            )
+                            .await;
                             break;
                         }
                     }

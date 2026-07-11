@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::logging::{debug, info, warn};
 use tokio::sync::RwLock;
@@ -14,8 +14,43 @@ use tokio_util::sync::CancellationToken;
 use saorsa_core::DhtNetworkEvent;
 
 use crate::ant_protocol::XorName;
+use crate::replication::config::PENDING_VERIFY_MAX_AGE;
 use crate::replication::scheduling::ReplicationQueues;
 use crate::replication::types::BootstrapState;
+
+// ---------------------------------------------------------------------------
+// Bootstrap-drain DoS backstops
+// ---------------------------------------------------------------------------
+//
+// A capacity-rejected source blocks bootstrap drain only until it re-delivers
+// its overflowed hints (see `note_capacity_rejected`). Left unbounded, that is
+// a cheap, permanent audit-subsystem DoS: a single Byzantine close-neighbour
+// can return one over-cap `NeighborSyncRequest` burst then go silent (or
+// leave), and — because the set is only ever cleared by that *same* source
+// completing a later clean admission cycle — the victim's `is_bootstrapping`
+// flag stays `true` forever, permanently pausing its storage audits
+// (`audit.rs` Invariant 19). The two backstops below bound that block.
+
+/// A capacity-rejected source blocks bootstrap drain for at most this long.
+///
+/// Matched to [`PENDING_VERIFY_MAX_AGE`] — the age at which the hints that
+/// overflowed `pending_verify` stale-evict from the queue anyway — so once a
+/// source's owed keys would have aged out regardless, we stop letting that
+/// source's silence hold the whole bootstrap open. Honest sources keep their
+/// full re-delivery window (they re-hint on their next sync cycle, well inside
+/// this TTL); only a stalled or departed source is evicted.
+pub const CAPACITY_REJECT_REDELIVER_TTL: Duration = PENDING_VERIFY_MAX_AGE;
+
+/// Absolute upper bound on how long a node may remain in replication
+/// bootstrap.
+///
+/// Once `BootstrapState::bootstrap_started_at` is this old,
+/// [`check_bootstrap_drained`] force-completes even if a source still has
+/// outstanding capacity-rejected hints (or a peer request is genuinely stuck),
+/// guaranteeing the audit subsystem always comes online. Chosen at 2×
+/// [`CAPACITY_REJECT_REDELIVER_TTL`] so the per-source TTL is the normal
+/// bound and this deadline is only the last-resort ceiling.
+pub const BOOTSTRAP_MAX_DURATION: Duration = Duration::from_secs(60 * 60);
 
 // ---------------------------------------------------------------------------
 // DHT bootstrap gate
@@ -114,7 +149,34 @@ pub async fn check_bootstrap_drained(
     queues: &ReplicationQueues,
 ) -> bool {
     let mut state = bootstrap_state.write().await;
+    drain_decision(&mut state, queues, Instant::now())
+}
+
+/// Pure drain decision (clock injected for testability).
+///
+/// This is the body of [`check_bootstrap_drained`] with `now` supplied by the
+/// caller so the per-source TTL eviction and the absolute-deadline backstop can
+/// be unit-tested deterministically (no sleeping, no `Instant` subtraction).
+/// Mutates `state`: it evicts capacity-rejected sources older than
+/// [`CAPACITY_REJECT_REDELIVER_TTL`] and may set `state.drained`.
+fn drain_decision(state: &mut BootstrapState, queues: &ReplicationQueues, now: Instant) -> bool {
     if state.drained {
+        return true;
+    }
+
+    // Absolute-deadline backstop. Evaluated first so a genuinely stuck
+    // bootstrap — a wedged peer request, or a sustained flooder that keeps the
+    // capacity-reject set populated — still always completes. Without this, one
+    // Byzantine neighbour permanently pins `is_bootstrapping` and pauses the
+    // victim's audits (audit.rs Invariant 19).
+    if now.saturating_duration_since(state.bootstrap_started_at) >= BOOTSTRAP_MAX_DURATION {
+        warn!(
+            "Bootstrap force-completing at absolute deadline ({}s) with {} source(s) \
+             still owing re-hints",
+            BOOTSTRAP_MAX_DURATION.as_secs(),
+            state.capacity_rejected_sources.len(),
+        );
+        state.drained = true;
         return true;
     }
 
@@ -125,9 +187,17 @@ pub async fn check_bootstrap_drained(
     // Hints capacity-rejected at the pending_verify bounds during bootstrap
     // must be re-delivered by the originating source before drain can be
     // claimed; otherwise we'd silently mark ourselves complete with
-    // outstanding work the source still owes us.
-    // The set retires per-source as each source's next admission cycle
-    // completes with zero rejections — see `clear_capacity_rejected`.
+    // outstanding work the source still owes us. The set retires per-source as
+    // each source's next admission cycle completes with zero rejections (see
+    // `clear_capacity_rejected`) OR when a source stops re-delivering for
+    // longer than CAPACITY_REJECT_REDELIVER_TTL (its owed keys have stale-
+    // evicted from pending_verify by then, so holding drain open serves no
+    // purpose and is the DoS lever).
+    state
+        .capacity_rejected_sources
+        .retain(|_, first_rejected_at| {
+            now.saturating_duration_since(*first_rejected_at) < CAPACITY_REJECT_REDELIVER_TTL
+        });
     if !state.capacity_rejected_sources.is_empty() {
         let n = state.capacity_rejected_sources.len();
         debug!("Bootstrap NOT drained: {n} source(s) have outstanding capacity-rejected hints");
@@ -155,7 +225,15 @@ pub async fn note_capacity_rejected(
     source: saorsa_core::identity::PeerId,
 ) {
     let mut state = bootstrap_state.write().await;
-    if state.capacity_rejected_sources.insert(source) {
+    let now = Instant::now();
+    // Record the FIRST rejection time and keep it: `entry().or_insert(now)`
+    // never overwrites an existing timestamp. This is load-bearing for the TTL
+    // backstop in `drain_decision` — a sustained flooder must not be able to
+    // extend its block by refreshing the timestamp on every over-cap burst; the
+    // per-source TTL is measured from when the source *first* overflowed.
+    let before = state.capacity_rejected_sources.len();
+    state.capacity_rejected_sources.entry(source).or_insert(now);
+    if state.capacity_rejected_sources.len() != before {
         let n = state.capacity_rejected_sources.len();
         debug!(
             "Bootstrap: source {source} now has outstanding capacity-rejected hints \
@@ -175,7 +253,7 @@ pub async fn clear_capacity_rejected(
     source: &saorsa_core::identity::PeerId,
 ) {
     let mut state = bootstrap_state.write().await;
-    if state.capacity_rejected_sources.remove(source) {
+    if state.capacity_rejected_sources.remove(source).is_some() {
         let n = state.capacity_rejected_sources.len();
         debug!(
             "Bootstrap: cleared outstanding capacity rejections for {source} \
@@ -223,12 +301,12 @@ pub async fn decrement_pending_requests(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use tokio::sync::RwLock;
 
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::replication::scheduling::ReplicationQueues;
@@ -246,7 +324,8 @@ mod tests {
             drained: true,
             pending_peer_requests: 5,
             pending_keys: HashSet::new(),
-            capacity_rejected_sources: HashSet::new(),
+            capacity_rejected_sources: HashMap::new(),
+            bootstrap_started_at: Instant::now(),
         }));
         let queues = ReplicationQueues::new();
 
@@ -262,7 +341,8 @@ mod tests {
             drained: false,
             pending_peer_requests: 2,
             pending_keys: HashSet::new(),
-            capacity_rejected_sources: HashSet::new(),
+            capacity_rejected_sources: HashMap::new(),
+            bootstrap_started_at: Instant::now(),
         }));
         let queues = ReplicationQueues::new();
 
@@ -278,7 +358,8 @@ mod tests {
             drained: false,
             pending_peer_requests: 0,
             pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
-            capacity_rejected_sources: HashSet::new(),
+            capacity_rejected_sources: HashMap::new(),
+            bootstrap_started_at: Instant::now(),
         }));
         let queues = ReplicationQueues::new();
 
@@ -293,7 +374,8 @@ mod tests {
             drained: false,
             pending_peer_requests: 0,
             pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
-            capacity_rejected_sources: HashSet::new(),
+            capacity_rejected_sources: HashMap::new(),
+            bootstrap_started_at: Instant::now(),
         }));
         let mut queues = ReplicationQueues::new();
 
@@ -405,5 +487,76 @@ mod tests {
 
         clear_capacity_rejected(&state, &source_b).await;
         assert!(check_bootstrap_drained(&state, &queues).await);
+    }
+
+    /// Regression (bootstrap-stall DoS): a source that capacity-rejected once
+    /// then went silent (hit-and-run) must NOT block drain past the per-source
+    /// re-deliver TTL. Before the fix, such a source stayed in
+    /// `capacity_rejected_sources` forever and `check_bootstrap_drained`
+    /// returned `false` permanently — permanently pausing the victim's audits.
+    /// The clock is injected via `drain_decision` so the 30-minute TTL is
+    /// exercised deterministically without sleeping.
+    #[test]
+    fn stalled_capacity_rejected_source_cannot_block_drain_forever() {
+        let mut state = BootstrapState::new();
+        let t0 = state.bootstrap_started_at;
+        let source = saorsa_core::identity::PeerId::from_bytes([9u8; 32]);
+        // Source overflowed once, at t0, and never re-delivered.
+        state.capacity_rejected_sources.insert(source, t0);
+        let queues = ReplicationQueues::new();
+
+        // Just before the TTL: still blocked — the honest re-delivery window is
+        // intact, so a source that is merely slow to re-hint is not evicted.
+        let before_ttl = t0 + CAPACITY_REJECT_REDELIVER_TTL.saturating_sub(Duration::from_secs(1));
+        assert!(
+            !drain_decision(&mut state, &queues, before_ttl),
+            "within the re-deliver TTL the source must still block drain"
+        );
+        assert!(
+            state.capacity_rejected_sources.contains_key(&source),
+            "source must not be evicted before the TTL"
+        );
+
+        // Past the TTL: the stalled source is evicted and, with no other
+        // outstanding work, bootstrap drains.
+        let after_ttl = t0 + CAPACITY_REJECT_REDELIVER_TTL + Duration::from_secs(1);
+        assert!(
+            drain_decision(&mut state, &queues, after_ttl),
+            "a stalled/departed capacity-rejected source must not block drain past the TTL"
+        );
+        assert!(state.drained, "drained flag must be set");
+        assert!(
+            state.capacity_rejected_sources.is_empty(),
+            "the stalled source must be evicted at the TTL"
+        );
+    }
+
+    /// Regression (bootstrap-stall DoS): the absolute deadline force-completes
+    /// bootstrap even when a source is still actively (freshly) capacity-
+    /// rejecting, so a sustained flooder that keeps its entry fresh cannot pin
+    /// `is_bootstrapping` forever.
+    #[test]
+    fn bootstrap_force_completes_at_absolute_deadline() {
+        let mut state = BootstrapState::new();
+        let t0 = state.bootstrap_started_at;
+        let now = t0 + BOOTSTRAP_MAX_DURATION + Duration::from_secs(1);
+        // A FRESH rejection (timestamped `now`, nowhere near its own TTL): only
+        // the absolute deadline can complete this bootstrap.
+        let flooder = saorsa_core::identity::PeerId::from_bytes([0xEE; 32]);
+        state.capacity_rejected_sources.insert(flooder, now);
+        let queues = ReplicationQueues::new();
+
+        assert!(
+            drain_decision(&mut state, &queues, now),
+            "bootstrap must force-complete once past BOOTSTRAP_MAX_DURATION"
+        );
+        assert!(state.drained, "drained flag must be set at the deadline");
+        // The deadline short-circuits before TTL eviction runs, so the fresh
+        // flooder is still recorded — proving it was the deadline, not the TTL,
+        // that completed bootstrap.
+        assert!(
+            state.capacity_rejected_sources.contains_key(&flooder),
+            "deadline completion must not depend on evicting the flooder"
+        );
     }
 }

@@ -676,16 +676,35 @@ pub struct BootstrapState {
     /// fetch pipeline.
     pub pending_keys: HashSet<XorName>,
     /// Peers whose last bootstrap admission cycle had one or more hints
-    /// silently dropped at the `pending_verify` capacity bounds. Each entry
+    /// silently dropped at the `pending_verify` capacity bounds, mapped to
+    /// the [`Instant`] of that source's **first** such rejection. Each entry
     /// represents "this source still owes us at least one re-hinted key
     /// after the queues drain". `check_bootstrap_drained` refuses to claim
-    /// the node fully drained while this set is non-empty: a source's
+    /// the node fully drained while this map is non-empty: a source's
     /// presence is cleared by its next admission cycle that completes with
     /// zero capacity rejections (i.e. the source successfully re-delivered
     /// everything that previously overflowed). Tracking per-source instead
     /// of a global counter prevents one peer's rejection from being
     /// "cleared" by an unrelated peer's clean cycle.
-    pub capacity_rejected_sources: HashSet<PeerId>,
+    ///
+    /// The recorded first-rejection time bounds the block: a source that
+    /// never re-delivers is evicted once its entry is older than
+    /// [`CAPACITY_REJECT_REDELIVER_TTL`], so a Byzantine neighbour that sends
+    /// one over-cap burst then goes silent cannot pin this map non-empty
+    /// forever (which would keep `is_bootstrapping` true and permanently
+    /// pause the victim's audits — see the `bootstrap` module tests).
+    ///
+    /// [`CAPACITY_REJECT_REDELIVER_TTL`]: super::bootstrap::CAPACITY_REJECT_REDELIVER_TTL
+    pub capacity_rejected_sources: HashMap<PeerId, Instant>,
+    /// When this node started replication bootstrap. Used as an absolute
+    /// backstop: [`check_bootstrap_drained`] force-completes once
+    /// `bootstrap_started_at.elapsed() >=` [`BOOTSTRAP_MAX_DURATION`],
+    /// guaranteeing bootstrap always finishes regardless of stalled peer
+    /// requests or a sustained capacity-reject flood.
+    ///
+    /// [`check_bootstrap_drained`]: super::bootstrap::check_bootstrap_drained
+    /// [`BOOTSTRAP_MAX_DURATION`]: super::bootstrap::BOOTSTRAP_MAX_DURATION
+    pub bootstrap_started_at: Instant,
 }
 
 impl BootstrapState {
@@ -696,7 +715,8 @@ impl BootstrapState {
             drained: false,
             pending_peer_requests: 0,
             pending_keys: HashSet::new(),
-            capacity_rejected_sources: HashSet::new(),
+            capacity_rejected_sources: HashMap::new(),
+            bootstrap_started_at: Instant::now(),
         }
     }
 
