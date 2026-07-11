@@ -1,0 +1,102 @@
+# cargo-deny configuration for ant-node.
+#
+# Adds license / bans / source-pinning enforcement on top of the existing
+# `cargo audit` job (advisories only). Schema targets cargo-deny >= 0.18
+# (as shipped by EmbarkStudios/cargo-deny-action@v2): `[advisories].unmaintained`
+# is the scope enum (all|workspace|transitive|none), vulnerabilities always fail,
+# and the `[licenses].allow` list is authoritative (anything unlisted fails).
+#
+# License policy:
+#   - ant-node itself is MIT OR Apache-2.0, but its dependency graph HARD-REQUIRES
+#     copyleft crates: saorsa-core is AGPL-3.0, and saorsa-transport /
+#     self_encryption are GPL-3.0. Those are allowed deliberately (both the bare
+#     and `-or-later` forms, so the check matches whichever a crate declares).
+#   - Standard permissive OSS set (MIT/Apache/BSD/ISC/Unicode/Zlib/...) allowed
+#     for dependencies. MPL-2.0 (weak, file-scoped copyleft) allowed. OpenSSL
+#     allowed for the ring/aws-lc-sys crypto stack.
+#
+# Advisory policy:
+#   - Vulnerabilities fail the check (this is what the `cargo audit` job already
+#     enforces). Yanked crates are denied. Unmaintained crates are surfaced;
+#     each currently-present one is waived below with a written reason, so a NEW
+#     unmaintained crate fails the check by design (the prompt to triage).
+#   - RUSTSEC-2026-0204 (crossbeam-epoch) is deliberately NOT waived — it is a
+#     live vulnerability and is fixed by bumping the lockfile (see the companion
+#     `fix(deps): bump crossbeam-epoch to 0.9.20` change).
+#
+# NOTE: this ignore list was seeded offline from a supply-chain review of this
+# tree, not from a live `cargo deny check` run on the branch. Run
+# `cargo deny check advisories bans licenses sources` once and add a reasoned
+# waiver for anything tree-specific the local resolve surfaces before merging.
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-apple-darwin" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-pc-windows-msvc" },
+]
+
+[licenses]
+# Authoritative allow-list (cargo-deny >= 0.18): anything not listed fails.
+allow = [
+    # Copyleft actually present in the dependency graph (deliberate — see policy
+    # note above). Both bare and `-or-later` forms are listed.
+    "AGPL-3.0",
+    "AGPL-3.0-or-later",
+    "GPL-3.0",
+    "GPL-3.0-or-later",
+
+    # Standard permissive OSS set.
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "0BSD",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate dependency versions are flagged but not denied — a large crypto/EVM
+# graph has known unavoidable duplicates. Tighten to "deny" once eliminated.
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Yanked versions are a release-management failure — block them.
+yanked = "deny"
+# Surface unmaintained crates anywhere in the graph; each present one is waived
+# below with a reason, so a newly-appearing unmaintained crate fails by design.
+unmaintained = "all"
+
+# Ignored advisories — each MUST carry a written reason. Seeded from a review of
+# this tree's `cargo deny check advisories` findings; do NOT waive vulnerabilities
+# (only unmaintained/informational notices are waived here).
+ignore = [
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill unmaintained: transitive via postcard -> heapless. Unmaintained status only, no vulnerability; no runtime-reachable defect." },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained: build-time proc-macro helper pulled via the alloy stack; expands at compile time, not linked into any shipped binary. Unmaintained only." },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained: build-time only, pulled exclusively by alloy-sol-macro (a proc-macro crate) to expand Solidity bindings; not in any shipped binary. Unmaintained only." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained: transitive via the transport TLS stack. Unmaintained status only, no vulnerability." },
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained (team ceased development; 1.3.3 considered complete): transitive serialization dep. Unmaintained status only, no vulnerability." },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

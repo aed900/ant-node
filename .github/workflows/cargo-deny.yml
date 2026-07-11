@@ -1,0 +1,21 @@
+name: cargo-deny
+
+# Supply-chain gate: license policy, banned/duplicate deps, source pinning, and
+# advisories. Additive to the existing `security` (cargo audit) job in ci.yml —
+# cargo-deny adds license + bans + sources enforcement that cargo audit cannot.
+
+on:
+  push:
+    branches: [main, "rc-*"]
+  pull_request:
+    branches: [main, "rc-*"]
+
+jobs:
+  cargo-deny:
+    name: Supply Chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
