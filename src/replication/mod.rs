@@ -612,6 +612,16 @@ impl ReplicationEngine {
         *self.is_bootstrapping.read().await
     }
 
+    /// Cloneable handle to the replication bootstrap flag (`true` while
+    /// bootstrapping).
+    ///
+    /// Lets a readiness probe query bootstrap state without borrowing the
+    /// engine (which the node's run loop consumes via `&mut self`).
+    #[must_use]
+    pub fn is_bootstrapping_handle(&self) -> Arc<RwLock<bool>> {
+        Arc::clone(&self.is_bootstrapping)
+    }
+
     /// Wait until the replication bootstrap phase completes.
     ///
     /// Returns immediately if bootstrap has already completed. Useful for

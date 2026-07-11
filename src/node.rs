@@ -532,6 +532,30 @@ impl RunningNode {
             info!("Replication engine started");
         }
 
+        // Start the liveness/readiness probe server. This fills the otherwise-
+        // dead `metrics_port` for ant-node (Prometheus metrics are served by
+        // the transport layer, not here). Skipped when the port is 0. Built
+        // from cheap cloneable handles so it does not borrow the run loop.
+        {
+            let probe = crate::health::ReadinessProbe::new(
+                self.replication_engine
+                    .as_ref()
+                    .map(ReplicationEngine::is_bootstrapping_handle),
+                Arc::clone(&self.p2p_node),
+                crate::ant_protocol::CLOSE_GROUP_SIZE,
+                self.ant_protocol.is_some(),
+            );
+            tokio::spawn(crate::health::serve(
+                self.config.payment.metrics_port,
+                probe,
+                self.shutdown.clone(),
+            ));
+            info!(
+                port = self.config.payment.metrics_port,
+                "Health probe server task spawned (/livez, /readyz)"
+            );
+        }
+
         // Start upgrade monitor if enabled
         if let Some(monitor) = self.upgrade_monitor.take() {
             let events_tx = self.events_tx.clone();

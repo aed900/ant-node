@@ -48,6 +48,7 @@ pub mod config;
 pub mod devnet;
 pub mod error;
 pub mod event;
+pub mod health;
 pub mod logging;
 pub mod node;
 pub mod payment;
