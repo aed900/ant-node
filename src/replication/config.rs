@@ -274,6 +274,31 @@ const REPLICATION_MESSAGE_SIZE_MIB: usize = 10;
 /// Maximum replication wire message size.
 pub const MAX_REPLICATION_MESSAGE_SIZE: usize = REPLICATION_MESSAGE_SIZE_MIB * 1024 * 1024;
 
+/// Hard cap on the number of hints processed from a single inbound
+/// `NeighborSyncRequest` (`replica_hints` and `paid_hints`, each).
+///
+/// The `MAX_REPLICATION_MESSAGE_SIZE` ceiling alone permits ~327,680
+/// `XorName`s (32 B each) per hint vector, and every admitted hint drives a
+/// routing-table k-closest lookup plus a `storage.exists` on the **inline**
+/// (non-spawned) replication intake path — so an unbounded batch from one
+/// routing-table peer head-of-line-blocks all other replication intake.
+///
+/// This is a **constant**, deliberately independent of `stored_chunks`
+/// (unlike the `2*sqrt(N)` audit-key bound in `max_incoming_audit_keys`),
+/// because a 0-chunk bootstrap node must still admit a useful hint batch — the
+/// exact edge case the old "no per-request limit" handler comment protected.
+/// ~10x below the wire ceiling, far above any honest close-group hint batch.
+pub const MAX_INBOUND_SYNC_HINTS: usize = 32_768;
+
+/// Hard cap on the number of keys processed from a single inbound
+/// `VerificationRequest`.
+///
+/// Mirrors [`MAX_INBOUND_SYNC_HINTS`]: each key drives a synchronous
+/// `storage.exists` LMDB read on the inline replication intake path, so the
+/// ~327k keys a 10 MiB message can carry are a per-message CPU/IO amplifier.
+/// Independent of `stored_chunks` for the same bootstrap reason.
+pub const MAX_VERIFICATION_KEYS: usize = 32_768;
+
 /// Headroom reserved for the envelope (enum tags, ids, length prefixes) when
 /// sizing a round-2 byte-challenge batch against the wire cap.
 const BYTE_CHALLENGE_RESPONSE_HEADROOM: usize = 64 * 1024;

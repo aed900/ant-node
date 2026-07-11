@@ -60,7 +60,8 @@ use crate::replication::commitment_state::{
 };
 use crate::replication::config::{
     max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
-    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS, REPLICATION_PROTOCOL_ID,
+    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS, MAX_INBOUND_SYNC_HINTS,
+    MAX_VERIFICATION_KEYS, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -2587,6 +2588,32 @@ async fn handle_paid_notify(
     Ok(())
 }
 
+/// Truncate an inbound key/hint vector to at most `max` entries, `debug!`-
+/// logging when it does.
+///
+/// Bounds the per-message work an inbound routing-table peer can force on the
+/// inline replication intake path (each key drives a routing-table lookup
+/// and/or a `storage.exists`). `max` is a stored-chunk-independent constant
+/// ([`MAX_INBOUND_SYNC_HINTS`] / [`MAX_VERIFICATION_KEYS`]) so a 0-chunk
+/// bootstrap node still receives its full honest batch.
+fn cap_inbound_keys<'a>(
+    source: &PeerId,
+    kind: &str,
+    keys: &'a [XorName],
+    max: usize,
+) -> &'a [XorName] {
+    if keys.len() > max {
+        debug!(
+            "Replication intake from {source}: truncating {} {kind} to {max}",
+            keys.len(),
+        );
+        // In-bounds by the check above; `.get` keeps this panic-free.
+        keys.get(..max).unwrap_or(keys)
+    } else {
+        keys
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_neighbor_sync_request(
     source: &PeerId,
@@ -2607,11 +2634,14 @@ async fn handle_neighbor_sync_request(
 ) -> Result<()> {
     let self_id = *p2p_node.peer_id();
 
-    // No per-request hint count limit: the wire message size limit
-    // (MAX_REPLICATION_MESSAGE_SIZE) already caps the payload. Unlike audit
-    // challenges, sync hints don't drive expensive computation — they just
-    // enter the verification queue. A per-request limit here would break
-    // bootstrap replication for newly-joined nodes with 0 stored chunks.
+    // Inbound hints are bounded before admission (see the cap below). The wire
+    // size limit (MAX_REPLICATION_MESSAGE_SIZE) alone permits ~327k hints, and
+    // each admitted hint drives a routing-table k-closest lookup +
+    // storage.exists on this inline (non-spawned) intake path, so an unbounded
+    // batch from a single routing-table peer head-of-line-blocks all other
+    // replication intake. MAX_INBOUND_SYNC_HINTS is a stored-chunk-independent
+    // constant so a 0-chunk bootstrap node still admits a useful batch (the
+    // case the old "no per-request limit" comment protected).
 
     // Build response (outbound hints).
     let (response, sent_replica_hints, sender_in_rt) =
@@ -2659,12 +2689,24 @@ async fn handle_neighbor_sync_request(
             .await;
     }
 
-    // Admit inbound hints and queue for verification.
+    // Admit inbound hints and queue for verification (count-bounded).
+    let replica_hints = cap_inbound_keys(
+        source,
+        "replica sync hints",
+        &request.replica_hints,
+        MAX_INBOUND_SYNC_HINTS,
+    );
+    let paid_hints = cap_inbound_keys(
+        source,
+        "paid sync hints",
+        &request.paid_hints,
+        MAX_INBOUND_SYNC_HINTS,
+    );
     let outcome = admit_and_queue_hints(
         &self_id,
         source,
-        &request.replica_hints,
-        &request.paid_hints,
+        replica_hints,
+        paid_hints,
         p2p_node,
         config,
         storage,
@@ -2700,13 +2742,24 @@ async fn handle_verification_request(
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    // No per-request key count limit: the wire message size limit
-    // (MAX_REPLICATION_MESSAGE_SIZE) already caps the payload. Verification
-    // does cheap storage lookups per key, not expensive computation like
-    // audit digest generation.
+    // Bound the number of keys processed from one inbound verification request.
+    // Each key drives a synchronous storage.exists LMDB read on this inline
+    // intake path; the 10 MiB wire ceiling alone permits ~327k keys, which a
+    // routing-table peer can use to head-of-line-block all other replication
+    // intake. Mirror the audit-path key cap, but as a stored-chunk-independent
+    // constant. Unlike audit (which has a Rejected response), VerificationResponse
+    // has no reject shape, so we truncate-and-respond for the first
+    // MAX_VERIFICATION_KEYS (an honest peer never exceeds the cap); this bounds
+    // the amplification identically while preserving the request/response contract.
+    let keys = cap_inbound_keys(
+        source,
+        "verification keys",
+        &request.keys,
+        MAX_VERIFICATION_KEYS,
+    );
 
     #[allow(clippy::cast_possible_truncation)]
-    let keys_len = request.keys.len() as u32;
+    let keys_len = keys.len() as u32;
     let paid_check_set: HashSet<u32> = request
         .paid_list_check_indices
         .iter()
@@ -2715,7 +2768,7 @@ async fn handle_verification_request(
             if idx >= keys_len {
                 warn!(
                     "Verification request from {source}: paid_list_check_index {idx} out of bounds (keys.len() = {})",
-                    request.keys.len(),
+                    keys.len(),
                 );
                 false
             } else {
@@ -2724,8 +2777,8 @@ async fn handle_verification_request(
         })
         .collect();
 
-    let mut results = Vec::with_capacity(request.keys.len());
-    for (i, key) in request.keys.iter().enumerate() {
+    let mut results = Vec::with_capacity(keys.len());
+    for (i, key) in keys.iter().enumerate() {
         let present = storage.exists(key).unwrap_or(false);
         let paid = if paid_check_set.contains(&u32::try_from(i).unwrap_or(u32::MAX)) {
             Some(paid_list.contains(key).unwrap_or(false))
@@ -5056,9 +5109,10 @@ async fn rebuild_and_rotate_commitment(
 mod tests {
     use super::{
         apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
-        audit_failure_revokes_holder_credit, audit_launch_decision, config, cooldown_allows_audit,
-        first_failed_key_label, fresh_offer_payment_context, paid_notify_payment_context,
-        quote_within_audit_window, MONETIZED_AUDIT_SKEW_MARGIN,
+        audit_failure_revokes_holder_credit, audit_launch_decision, cap_inbound_keys, config,
+        cooldown_allows_audit, first_failed_key_label, fresh_offer_payment_context,
+        paid_notify_payment_context, quote_within_audit_window, MAX_INBOUND_SYNC_HINTS,
+        MAX_VERIFICATION_KEYS, MONETIZED_AUDIT_SKEW_MARGIN,
     };
     use crate::payment::VerificationContext;
     use crate::replication::recent_provers::RecentProvers;
@@ -5079,6 +5133,45 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = b;
         k
+    }
+
+    /// PR: replication-intake key-vector cap. `cap_inbound_keys` bounds how
+    /// many hints/keys a single inbound routing-table peer can push through the
+    /// inline replication intake path (each key would otherwise drive a
+    /// routing-table lookup and/or a `storage.exists`), while leaving honest
+    /// (under-cap) batches — including a 0-chunk bootstrap node's — untouched.
+    #[test]
+    fn inbound_intake_keys_are_capped() {
+        use crate::ant_protocol::XorName;
+        let src = test_peer(0x11);
+
+        // Over-cap sync-hint batch -> truncated to exactly the constant.
+        let over: Vec<XorName> = vec![[0u8; 32]; MAX_INBOUND_SYNC_HINTS + 5_000];
+        assert_eq!(
+            cap_inbound_keys(&src, "replica", &over, MAX_INBOUND_SYNC_HINTS).len(),
+            MAX_INBOUND_SYNC_HINTS
+        );
+
+        // Over-cap verification-key batch -> truncated to its constant.
+        let vkeys: Vec<XorName> = vec![[1u8; 32]; MAX_VERIFICATION_KEYS + 5_000];
+        assert_eq!(
+            cap_inbound_keys(&src, "verify", &vkeys, MAX_VERIFICATION_KEYS).len(),
+            MAX_VERIFICATION_KEYS
+        );
+
+        // Honest under-cap batch passes through untouched.
+        let under: Vec<XorName> = vec![[7u8; 32]; 16];
+        assert_eq!(
+            cap_inbound_keys(&src, "paid", &under, MAX_INBOUND_SYNC_HINTS).len(),
+            16
+        );
+
+        // Exactly at the cap is not truncated.
+        let exact: Vec<XorName> = vec![[3u8; 32]; MAX_INBOUND_SYNC_HINTS];
+        assert_eq!(
+            cap_inbound_keys(&src, "replica", &exact, MAX_INBOUND_SYNC_HINTS).len(),
+            MAX_INBOUND_SYNC_HINTS
+        );
     }
 
     #[test]
