@@ -155,6 +155,10 @@ impl AutoApplyUpgrader {
     /// # Errors
     ///
     /// Returns an error only for critical failures where rollback also fails.
+    // The added post-extraction version-binding guard pushes this one line past
+    // the pedantic 100-line soft cap; the linear download/verify/backup/replace/
+    // restart flow reads more clearly kept inline than fragmented.
+    #[allow(clippy::too_many_lines)]
     pub async fn apply_upgrade(&self, info: &UpgradeInfo) -> Result<UpgradeResult> {
         info!(
             "Starting auto-apply upgrade from {} to {}",
@@ -213,6 +217,19 @@ impl AutoApplyUpgrader {
                 });
             }
         };
+
+        // Version-binding: confirm the extracted binary self-reports the target
+        // version before we back up and replace. See `verify_extracted_version`
+        // for the threat model (the ML-DSA release signature uses a version-
+        // independent context, so it attests "a valid release", not "release
+        // X.Y.Z"). Reuses the existing `on_disk_version` helper.
+        if let Err(reason) = verify_extracted_version(
+            on_disk_version(&extracted_binary).await.as_ref(),
+            &info.version,
+        ) {
+            warn!("Rejecting upgrade to {}: {reason}", info.version);
+            return Ok(UpgradeResult::RolledBack { reason });
+        }
 
         // Check if the on-disk binary has already been upgraded by a sibling service.
         // This prevents redundant backup/replace cycles when multiple nodes share one binary.
@@ -676,6 +693,35 @@ impl AutoApplyUpgrader {
     }
 }
 
+/// Decide whether an extracted binary's self-reported version is acceptable for
+/// an upgrade to `target`.
+///
+/// The ML-DSA release signature is computed over a version-independent context
+/// (`upgrade::signature::SIGNING_CONTEXT`), so it attests only that the bytes
+/// are *a* validly-signed ant-node release — not that they are release
+/// `target`. This guard closes the residual forced-downgrade / rollback vector
+/// (a validly-signed OLD archive presented under a NEW version tag by a
+/// compromised or MITM'd update source, or a same-UID cache-poisoning writer):
+/// the substituted old binary self-reports its true, older version and is
+/// rejected here before backup/replace.
+///
+/// Returns `Ok(())` iff `extracted == Some(target)`; otherwise an explanatory
+/// string for the `RolledBack` reason.
+fn verify_extracted_version(
+    extracted: Option<&Version>,
+    target: &Version,
+) -> std::result::Result<(), String> {
+    match extracted {
+        Some(v) if v == target => Ok(()),
+        Some(v) => Err(format!(
+            "extracted binary reports version {v}, expected {target}"
+        )),
+        None => Err(format!(
+            "could not determine extracted binary version (expected {target})"
+        )),
+    }
+}
+
 /// Run the on-disk binary with `--version` and parse the reported version.
 ///
 /// Returns `None` if the binary cannot be executed, times out, or the output
@@ -713,6 +759,20 @@ mod tests {
     fn test_auto_apply_upgrader_creation() {
         let upgrader = AutoApplyUpgrader::new();
         assert!(!upgrader.current_version().to_string().is_empty());
+    }
+
+    #[test]
+    fn extracted_version_must_match_target() {
+        let target = Version::new(0, 14, 2);
+        // Exact match is accepted.
+        assert!(verify_extracted_version(Some(&target), &target).is_ok());
+        // An older validly-signed binary is rejected — this is the
+        // forced-downgrade / rollback vector.
+        assert!(verify_extracted_version(Some(&Version::new(0, 13, 0)), &target).is_err());
+        // Any mismatch (including a higher self-report) is rejected.
+        assert!(verify_extracted_version(Some(&Version::new(0, 15, 0)), &target).is_err());
+        // Unparseable / unrunnable binary (None) is rejected fail-closed.
+        assert!(verify_extracted_version(None, &target).is_err());
     }
 
     #[test]
