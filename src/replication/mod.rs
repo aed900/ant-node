@@ -1105,6 +1105,11 @@ impl ReplicationEngine {
                             DhtNetworkEvent::PeerRemoved { peer_id } => {
                                 sync_state.write().await.remove_peer(&peer_id);
                                 repair_proofs.write().await.remove_peer(&peer_id);
+                                // Drop this peer's neighbor-sync maturity record
+                                // so `sync_history` cannot grow unbounded on
+                                // churn / identity rotation (it is keyed by
+                                // PeerId and otherwise never evicted).
+                                sync_history.write().await.remove(&peer_id);
                                 // v12: drop the commitment bytes and the
                                 // recent-prover credit so a churn / sybil
                                 // attacker cannot leave behind one

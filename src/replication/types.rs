@@ -638,7 +638,18 @@ impl NeighborSyncState {
         (old_priority_len - self.priority_order.len()) + (old_order_len - self.order.len())
     }
 
-    /// Remove a peer from any pending neighbor-sync state.
+    /// Remove a peer from any pending neighbor-sync state, and evict the
+    /// per-peer maps keyed by it.
+    ///
+    /// The returned `bool` reflects only whether the peer was in the sync
+    /// order/priority queues (unchanged semantics). In addition, the per-peer
+    /// maps (`last_sync_times`, `bootstrap_claims`, `bootstrap_claim_history`)
+    /// are evicted so they cannot grow unbounded on churn / identity rotation —
+    /// mirroring how the `PeerRemoved` handler already evicts
+    /// `last_commitment_by_peer`. `bootstrap_claim_history` was previously never
+    /// evicted (`clear_active_bootstrap_claim` deliberately retains it), so a
+    /// peer-ID-rotating adversary could grow it without bound; scoping it to
+    /// routing-table membership here bounds it.
     pub fn remove_peer(&mut self, peer: &PeerId) -> bool {
         let old_priority_len = self.priority_order.len();
         self.priority_order.retain(|queued| queued != peer);
@@ -650,6 +661,10 @@ impl NeighborSyncState {
                 self.cursor = self.cursor.saturating_sub(1);
             }
         }
+
+        self.last_sync_times.remove(peer);
+        self.bootstrap_claims.remove(peer);
+        self.bootstrap_claim_history.remove(peer);
 
         old_priority_len != self.priority_order.len() || old_order_len != self.order.len()
     }
@@ -1194,6 +1209,37 @@ mod tests {
         assert!(
             !state.is_cycle_complete(),
             "fresh cycle with peers should not be complete"
+        );
+    }
+
+    /// PR: per-peer map GC. `remove_peer` must evict the per-peer maps keyed by
+    /// the departing peer — especially `bootstrap_claim_history`, which is
+    /// otherwise never evicted and grows unbounded under peer-ID rotation.
+    #[test]
+    fn remove_peer_evicts_per_peer_maps() {
+        let peer = peer_id_from_byte(0x33);
+        let mut state = NeighborSyncState::new_cycle(vec![peer]);
+        let now = Instant::now();
+        state.last_sync_times.insert(peer, now);
+        // First claim populates both bootstrap_claims and _history.
+        let _ = state.observe_bootstrap_claim(peer, now, Duration::from_secs(60));
+        assert!(state.last_sync_times.contains_key(&peer));
+        assert!(state.bootstrap_claims.contains_key(&peer));
+        assert!(state.bootstrap_claim_history.contains_key(&peer));
+
+        state.remove_peer(&peer);
+
+        assert!(
+            !state.last_sync_times.contains_key(&peer),
+            "last_sync_times must be evicted on peer removal"
+        );
+        assert!(
+            !state.bootstrap_claims.contains_key(&peer),
+            "bootstrap_claims must be evicted on peer removal"
+        );
+        assert!(
+            !state.bootstrap_claim_history.contains_key(&peer),
+            "bootstrap_claim_history must be evicted — bounds the never-evicted map"
         );
     }
 
